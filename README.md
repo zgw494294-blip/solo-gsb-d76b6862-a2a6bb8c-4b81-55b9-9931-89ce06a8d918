@@ -5,13 +5,16 @@
 连续、带精确小数起止秒数的切片时间线。**完全离线**：服务不发起任何网络请求，
 `playlist_url` 仅用于解析相对 URI。
 
-提供四个接口：
+提供五个接口：
 
 - `POST /v1/reconcile`：复原整条切片时间线（序号、URI、精确十进制相对起止秒数、
   字节范围、不连续计数）。
 - `POST /v1/locate`：在同一份合并规则之上，解析
   `#EXT-X-PROGRAM-DATE-TIME`，按**节目绝对时间（UTC）**定位目标时刻所在的片段，
   返回片段序号、URI、UTC 起止时间与精确十进制片内偏移。
+- `POST /v1/intersect`：对**两路**直播清单各自执行相同的合并与 UTC 锚点推时，
+  只在两路都有已知节目时间的片段上求半开区间交集，输出每段配对的双方序号、
+  共同 UTC 起止时间及共同起点在各自片段内的精确秒偏移。
 - `POST /v1/vod`：把直播窗口按十进制秒区间 `[from_sec, to_sec)` 导出为一份
   **VOD 媒体清单文本**，并返回实际覆盖起止与两端多带的秒数。
 - `POST /v1/fetch-plan`：为复原后的窗口生成**媒体片段获取计划**——去重合并后的
@@ -26,7 +29,7 @@ docker compose up --build
 
 服务监听 **8000** 端口（容器内 `8000`，映射到宿主机 `8000`）：
 
-- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/vod`、`POST http://localhost:8000/v1/fetch-plan`
+- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/intersect`、`POST http://localhost:8000/v1/vod`、`POST http://localhost:8000/v1/fetch-plan`
 - 健康检查：`GET http://localhost:8000/healthz`
 - 交互式文档：`http://localhost:8000/docs`
 
@@ -229,6 +232,105 @@ curl -s http://localhost:8000/v1/locate \
   }'
 ```
 
+## `POST /v1/intersect`：求两路直播的共同节目时间区间
+
+请求体包含两路输入 `a`、`b`，每一路各自是与 `/v1/reconcile` 相同的
+`playlist_url` + 按抓取时间排序的 `snapshots`（每路长度 2～30，每份 1～100 段；
+`playlist_url` 同样仅作相对 URI 的解析基址，不会被请求）：
+
+```json
+{
+  "a": {
+    "playlist_url": "https://a.example.com/live/index.m3u8",
+    "snapshots": ["#EXTM3U\n...第 0 份...", "#EXTM3U\n...第 1 份..."]
+  },
+  "b": {
+    "playlist_url": "https://b.example.com/live/index.m3u8",
+    "snapshots": ["#EXTM3U\n...", "#EXTM3U\n..."]
+  }
+}
+```
+
+### 计算规则
+
+1. **各自合并、各自推时**：两路分别完整执行 `/v1/reconcile` 的合并规则与
+   `/v1/locate` 的 `#EXT-X-PROGRAM-DATE-TIME` 锚点校验、UTC 归一与精确十进制
+   推时；两路序号空间彼此独立，不要求序号相关。
+2. **只有已知时间参与**：只有**两路都有已知节目时间**的片段才参与交集。未锚定的
+   断点区间在本路没有已知时间，既不能用本路另一段时间补齐，也不能借另一路的时间
+   补齐——这样的片段不出现在任何配对中。
+3. **半开区间交集**：把每个已知片段看作 UTC 半开区间 `[start_at, end_at)`，对
+   两路片段求两两交集。两路切片边界不同时，按**双方边界**全部拆开，输出所有实际
+   交叠的（`a` 片段, `b` 片段）配对；**交集长度为零（仅端点相接）不输出**。
+4. **输出按 UTC 起点升序**；同一共同区间在每段配对内连续（仅端点相接的相邻配对
+   不会合并，因为它们对应不同的片段配对）。
+5. **同一路自身重叠 → 422**：若同一路**不同断点区间**的已知 UTC 时间自身发生
+   重叠，则一个共同时刻无法唯一确定该路片段，也就无法确定唯一配对，返回 422
+   （`ambiguous_program_time`，带 `stream` 与候选 `sequences`）。同一连续序号
+   区间内的片段在 UTC 上首尾相接，不会触发该校验。
+
+### 响应（200）
+
+例：`a` 路每段 2 秒（序号 0～2，覆盖 `:00～:06`），`b` 路每段 3 秒（序号 10～12，
+覆盖 `:00～:09`），两路同起点：
+
+```json
+{
+  "intervals": [
+    {"sequence_a": 0, "sequence_b": 10,
+     "start_at": "2024-01-01T19:04:00Z", "end_at": "2024-01-01T19:04:02Z",
+     "offset_a": "0", "offset_b": "0"},
+    {"sequence_a": 1, "sequence_b": 10,
+     "start_at": "2024-01-01T19:04:02Z", "end_at": "2024-01-01T19:04:03Z",
+     "offset_a": "0", "offset_b": "2"},
+    {"sequence_a": 1, "sequence_b": 11,
+     "start_at": "2024-01-01T19:04:03Z", "end_at": "2024-01-01T19:04:04Z",
+     "offset_a": "1", "offset_b": "0"},
+    {"sequence_a": 2, "sequence_b": 11,
+     "start_at": "2024-01-01T19:04:04Z", "end_at": "2024-01-01T19:04:06Z",
+     "offset_a": "0", "offset_b": "1"}
+  ]
+}
+```
+
+- `sequence_a` / `sequence_b`：该配对在各自合并时间线上的片段序号。
+- `start_at` / `end_at`：共同半开区间的 UTC 起止（RFC 3339，`Z` 结尾，含必要的
+  精确小数秒）。
+- `offset_a` / `offset_b`：共同起点相对**各自片段起点**的精确十进制片内秒偏移。
+- **没有任何共同覆盖时**（任一路全无锚点、两路已知时间不相交、或只端点相接），
+  返回 `200` 与 `{"intervals": []}`。
+
+错误均为 HTTP 422（请求体结构不合法由通用校验返回 `invalid_request`）：
+
+| `error` | 触发条件 |
+| --- | --- |
+| `ambiguous_program_time` | 同一路不同断点区间的已知 UTC 时间自身重叠，无法唯一配对；带 `stream`（`"a"`/`"b"`）与候选 `sequences` |
+| `program_time_conflict` | 某路跨快照同序号锚点 UTC 不一致，或同区间多锚点与十进制时长推算不一致；带 `stream`、`snapshot_index`、`sequence` |
+| 其余单路错误 | `invalid_playlist`、`sequence_rollback`、`sequence_gap`、`overlap_conflict` 等同 `/v1/reconcile`、`/v1/locate`，一律带 `stream` 指出出错的一路 |
+
+两路先后独立校验（先 `a` 后 `b`）；任一路失败即返回该路的错误，不做交集。
+
+```bash
+curl -s http://localhost:8000/v1/intersect \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:00Z\n#EXTINF:2,\na0.ts\n#EXTINF:2,\na1.ts\n#EXTINF:2,\na2.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:2,\na1.ts\n#EXTINF:2,\na2.ts\n#EXTINF:2,\na3.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:00Z\n#EXTINF:3,\nb10.ts\n#EXTINF:3,\nb11.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:11\n#EXTINF:3,\nb11.ts\n#EXTINF:3,\nb12.ts\n"
+      ]
+    }
+  }'
+```
+
 ## `POST /v1/vod`：导出指定时段的 VOD 媒体清单
 
 请求体在 `playlist_url` 与 `snapshots` 之外，接收十进制秒区间
@@ -409,6 +511,7 @@ app/
   hls.py         # 离线清单解析（序号 / 时长 / 断点 / 字节范围 / URI / PDT 锚点）
   reconcile.py   # 跨快照合并、连续性与一致性校验、时间轴计算、禁用标签检查
   locate.py      # PDT 精确 UTC 解析/推算、锚点一致性校验、半开区间定位
+  intersect.py   # 两路已知节目时间片段的半开交集、自身重叠致歧义校验
   vod.py         # 按秒区间选段、VOD 清单渲染（VERSION:4 / ENDLIST / 多带秒数）
   fetchplan.py   # 资源请求去重与字节区间合并、逐段响应体映射
   main.py        # FastAPI 路由、请求/响应模型、422/404 错误处理

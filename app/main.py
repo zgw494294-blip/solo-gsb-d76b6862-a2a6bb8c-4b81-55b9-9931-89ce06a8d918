@@ -14,6 +14,7 @@ from pydantic import field_validator
 
 from .hls import PlaylistParseError
 from .fetchplan import build_fetch_plan
+from .intersect import IntersectError, intersect_streams
 from .locate import (
     LocateError,
     format_program_time,
@@ -104,6 +105,13 @@ class FetchPlanRequest(ReconcileRequest):
         return value
 
 
+class IntersectRequest(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    a: ReconcileRequest
+    b: ReconcileRequest
+
+
 class SegmentOut(BaseModel):
     sequence: int
     uri: str
@@ -160,6 +168,19 @@ class FetchPlanResponse(BaseModel):
     segments: list[SegmentFetchOut]
 
 
+class CommonIntervalOut(BaseModel):
+    sequence_a: int
+    sequence_b: int
+    start_at: str
+    end_at: str
+    offset_a: str
+    offset_b: str
+
+
+class IntersectResponse(BaseModel):
+    intervals: list[CommonIntervalOut]
+
+
 class ErrorDetail(BaseModel):
     snapshot_index: Optional[int] = None
     sequence: Optional[int] = None
@@ -178,8 +199,9 @@ app = FastAPI(
     description=(
         "Reconstruct a contiguous segment timeline from ordered HLS media "
         "playlist snapshots, locate segments by program time, export "
-        "time ranges as VOD playlists, and plan the HTTP requests needed "
-        "to fetch every segment — entirely offline."
+        "time ranges as VOD playlists, plan the HTTP requests needed "
+        "to fetch every segment, and intersect the known program-time "
+        "coverage of two live streams — entirely offline."
     ),
 )
 
@@ -209,6 +231,19 @@ async def reconcile_error_handler(_request: Request, exc: ReconcileError) -> JSO
         exc.message,
         snapshot_index=exc.snapshot_index,
         sequence=exc.sequence,
+    )
+
+
+@app.exception_handler(IntersectError)
+async def intersect_error_handler(_request: Request, exc: IntersectError) -> JSONResponse:
+    return _error(
+        exc.code,
+        exc.message,
+        status=422,
+        stream=exc.stream,
+        snapshot_index=exc.snapshot_index,
+        sequence=exc.sequence,
+        sequences=exc.sequences,
     )
 
 
@@ -310,4 +345,27 @@ async def fetch_plan_endpoint(payload: FetchPlanRequest) -> FetchPlanResponse:
             )
             for item in plan.segments
         ],
+    )
+
+
+@app.post("/v1/intersect", response_model=IntersectResponse)
+async def intersect_endpoint(payload: IntersectRequest) -> IntersectResponse:
+    intervals = intersect_streams(
+        payload.a.playlist_url,
+        payload.a.snapshots,
+        payload.b.playlist_url,
+        payload.b.snapshots,
+    )
+    return IntersectResponse(
+        intervals=[
+            CommonIntervalOut(
+                sequence_a=item.sequence_a,
+                sequence_b=item.sequence_b,
+                start_at=format_program_time(item.start_at),
+                end_at=format_program_time(item.end_at),
+                offset_a=format(item.offset_a, "f"),
+                offset_b=format(item.offset_b, "f"),
+            )
+            for item in intervals
+        ]
     )

@@ -24,7 +24,7 @@ SEG_URL = "https://cdn.example.com/live/seg.ts"
 
 
 def m3u(segments, *, media_sequence=None, discont_sequence=None, discont_before=(),
-        byteranges=None, uris=None, pdt_before=None):
+        byteranges=None, uris=None, pdt_before=None, durations=None):
     """Build a small media playlist.
 
     segments: number of segments (durations 1.10)
@@ -33,6 +33,7 @@ def m3u(segments, *, media_sequence=None, discont_sequence=None, discont_before=
     byteranges: {index: "100@0" | "100"} (None entry means unranged).
     uris: optional per-index URI strings.
     pdt_before: {index: "2024-01-02T03:04:05Z"} EXT-X-PROGRAM-DATE-TIME values.
+    durations: optional per-index EXTINF duration strings (default "1.10").
     """
 
     lines = ["#EXTM3U"]
@@ -47,7 +48,8 @@ def m3u(segments, *, media_sequence=None, discont_sequence=None, discont_before=
             lines.append("#EXT-X-DISCONTINUITY")
         if i in pdt_before:
             lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{pdt_before[i]}")
-        lines.append("#EXTINF:1.10,")
+        duration = durations[i] if durations is not None else "1.10"
+        lines.append(f"#EXTINF:{duration},")
         if i in byteranges:
             lines.append(f"#EXT-X-BYTERANGE:{byteranges[i]}")
         uri = uris[i] if uris else "seg.ts"
@@ -1050,3 +1052,310 @@ def test_api_fetch_plan_merge_errors_still_return_422():
 def test_api_fetch_plan_rejects_wrong_snapshot_count():
     assert fetch_plan_post([m3u(1)]).status_code == 422
     assert fetch_plan_post([m3u(1)] * 31).status_code == 422
+
+# ------------------------------------------------- library: intersect streams
+
+from app.intersect import IntersectError, intersect_streams  # noqa: E402
+from app.locate import format_program_time  # noqa: E402
+
+URL_A = "https://a.example.com/live/index.m3u8"
+URL_B = "https://b.example.com/live/index.m3u8"
+T0 = "2024-01-01T19:04:00Z"
+
+
+def _plain_stream(url, seq, durations, anchor=T0, *, discont_before=(),
+                  pdt_extra=None, uris=None):
+    """Build a one-snapshot (duplicated) anchored stream with given durations."""
+
+    lines = ["#EXTM3U", f"#EXT-X-MEDIA-SEQUENCE:{seq}"]
+    pdt_extra = pdt_extra or {}
+    for i, duration in enumerate(durations):
+        if i in discont_before:
+            lines.append("#EXT-X-DISCONTINUITY")
+        if i == 0 or i in pdt_extra:
+            lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{pdt_extra.get(i, anchor)}")
+        lines.append(f"#EXTINF:{duration},")
+        lines.append((uris[i] if uris else f"s{seq + i}.ts"))
+    text = "\n".join(lines) + "\n"
+    return url, [text, text]
+
+
+def _render(intervals):
+    return [
+        (
+            item.sequence_a,
+            item.sequence_b,
+            format_program_time(item.start_at),
+            format_program_time(item.end_at),
+            format(item.offset_a, "f"),
+            format(item.offset_b, "f"),
+        )
+        for item in intervals
+    ]
+
+
+def test_intersect_splits_at_both_streams_boundaries():
+    # A: 3 segments of 2s -> boundaries :00 :02 :04 :06 (sequences 0..2)
+    # B: 3 segments of 3s -> boundaries :00 :03 :06 :09 (sequences 10..12)
+    ua, sa = _plain_stream(URL_A, 0, ["2", "2", "2"], uris=[f"a{i}.ts" for i in range(3)])
+    ub, sb = _plain_stream(URL_B, 10, ["3", "3", "3"], uris=[f"b{i}.ts" for i in range(3)])
+    result = _render(intersect_streams(ua, sa, ub, sb))
+    assert result == [
+        (0, 10, "2024-01-01T19:04:00Z", "2024-01-01T19:04:02Z", "0", "0"),
+        (1, 10, "2024-01-01T19:04:02Z", "2024-01-01T19:04:03Z", "0", "2"),
+        (1, 11, "2024-01-01T19:04:03Z", "2024-01-01T19:04:04Z", "1", "0"),
+        (2, 11, "2024-01-01T19:04:04Z", "2024-01-01T19:04:06Z", "0", "1"),
+    ]
+
+
+def test_intersect_exact_decimal_offsets():
+    # A segment [19:04:00.00, 19:04:02.50); B starts at 19:04:01.25 with
+    # duration 0.75 -> common [19:04:01.25, 19:04:02.00).
+    ua, sa = _plain_stream(URL_A, 0, ["2.50"])
+    ub, sb = _plain_stream(URL_B, 7, ["0.75"], anchor="2024-01-01T19:04:01.25Z")
+    result = intersect_streams(ua, sa, ub, sb)
+    assert len(result) == 1
+    item = result[0]
+    assert (item.sequence_a, item.sequence_b) == (0, 7)
+    assert format_program_time(item.start_at) == "2024-01-01T19:04:01.25Z"
+    assert format_program_time(item.end_at) == "2024-01-01T19:04:02Z"
+    assert format(item.offset_a, "f") == "1.25"
+    assert format(item.offset_b, "f") == "0.00"
+
+
+def test_intersect_zero_length_touch_is_not_output():
+    # A covers [00, 06); B starts exactly at :06 -> ranges only touch.
+    ua, sa = _plain_stream(URL_A, 0, ["2", "2", "2"])
+    ub, sb = _plain_stream(URL_B, 10, ["2"], anchor="2024-01-01T19:04:06Z")
+    assert intersect_streams(ua, sa, ub, sb) == []
+
+
+def test_intersect_no_common_coverage_returns_empty():
+    ua, sa = _plain_stream(URL_A, 0, ["2", "2"])
+    ub, sb = _plain_stream(URL_B, 0, ["2", "2"], anchor="2024-01-01T20:00:00Z")
+    assert intersect_streams(ua, sa, ub, sb) == []
+
+
+def test_intersect_unanchored_region_is_not_filled():
+    # A: anchored run seq0..2, then a discontinuity; seq3 is unanchored.
+    # B covers exactly the UTC range the unanchored seq3 would occupy if
+    # time were carried across the break — it must not pair.
+    snap_a = m3u(4, media_sequence=0, discont_before=(3,),
+                 durations=["2", "2", "2", "2"],
+                 pdt_before={0: T0}, uris=[f"a{i}.ts" for i in range(4)])
+    ua, sa = URL_A, [snap_a, snap_a]
+    ub, sb = _plain_stream(URL_B, 5, ["2"], anchor="2024-01-01T19:04:06Z",
+                           uris=["b5.ts"])
+    result = intersect_streams(ua, sa, ub, sb)
+    assert result == []
+
+
+def test_intersect_timezone_offsets_are_normalized_to_utc():
+    ua, sa = _plain_stream(URL_A, 0, ["2"], anchor="2024-01-02T03:04:00+08:00")
+    ub, sb = _plain_stream(URL_B, 0, ["2"], anchor="2024-01-01T19:04:01Z")
+    result = intersect_streams(ua, sa, ub, sb)
+    assert len(result) == 1
+    item = result[0]
+    assert format_program_time(item.start_at) == "2024-01-01T19:04:01Z"
+    assert format(item.offset_a, "f") == "1"
+    assert format(item.offset_b, "f") == "0"
+
+
+def test_intersect_self_overlapping_runs_in_one_stream_are_422():
+    # Stream A: two anchored runs (across a discontinuity) whose known UTC
+    # ranges overlap, so a common instant maps to two segments of A.
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:05Z",
+        "#EXTINF:10,", "a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:06Z",
+        "#EXTINF:10,", "a1.ts",
+    ]) + "\n"
+    ub, sb = _plain_stream(URL_B, 0, ["10"], anchor="2024-01-01T19:04:05Z",
+                           uris=["b0.ts"])
+    with pytest.raises(IntersectError) as exc:
+        intersect_streams(URL_A, [snap_a, snap_a], ub, sb)
+    assert exc.value.code == "ambiguous_program_time"
+    assert exc.value.stream == "a"
+    assert exc.value.sequences == [0, 1]
+
+
+def test_intersect_self_overlap_attributed_to_stream_b():
+    snap_b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:05Z",
+        "#EXTINF:10,", "b0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:05Z",
+        "#EXTINF:10,", "b1.ts",
+    ]) + "\n"
+    ua, sa = _plain_stream(URL_A, 0, ["10"], uris=["a0.ts"])
+    with pytest.raises(IntersectError) as exc:
+        intersect_streams(ua, sa, URL_B, [snap_b, snap_b])
+    assert exc.value.stream == "b"
+    assert exc.value.sequences == [0, 1]
+
+
+def test_intersect_anchor_conflict_is_422_with_old_code():
+    good = m3u(1, media_sequence=0, pdt_before={0: "2024-01-01T19:04:05Z"},
+               uris=["a.ts"])
+    bad = m3u(1, media_sequence=0, pdt_before={0: "2024-01-01T19:04:09Z"},
+              uris=["a.ts"])
+    ub, sb = _plain_stream(URL_B, 0, ["1"], anchor="2024-01-01T19:04:05Z",
+                           uris=["b.ts"])
+    with pytest.raises(IntersectError) as exc:
+        intersect_streams(URL_A, [good, bad], ub, sb)
+    assert exc.value.code == "program_time_conflict"
+    assert exc.value.stream == "a"
+    assert exc.value.snapshot_index == 1
+    assert exc.value.sequence == 0
+
+
+def test_intersect_merge_error_is_422_with_old_code():
+    s10 = m3u(2, media_sequence=10, uris=["a10.ts", "a11.ts"])
+    s9 = m3u(2, media_sequence=9, uris=["a9.ts", "a10.ts"])
+    ub, sb = _plain_stream(URL_B, 0, ["2"], uris=["b.ts"])
+    with pytest.raises(IntersectError) as exc:
+        intersect_streams(URL_A, [s10, s9], ub, sb)
+    assert exc.value.code == "sequence_rollback"
+    assert exc.value.stream == "a"
+    assert exc.value.snapshot_index == 1
+
+
+def test_intersect_counter_reuse_runs_stay_independent_and_sorted():
+    # Stream A reuses discontinuity counters across adjacent snapshots.
+    # a0: seq0..1 anchored at :00 (:00..:04), break at index 2, seq2..3 in a
+    # reused counter run but unanchored -> no known time.
+    # a1: seq4..5 anchored at :10 (:10..:14), break at index 2, seq6..7
+    # unanchored. Stream B anchored at :07 with 6s segments spanning :07..:19.
+    # The unanchored A segments can never pair; B's :13 boundary falls
+    # inside A5, so the pair is split there as well. Pairing order follows UTC:
+    #   A4 [10,12) x B20 [07,13) -> [10,12)
+    #   A5 [12,14) x B20         -> [12,13)
+    #   A5 [12,14) x B21 [13,19) -> [13,14)
+    a0 = m3u(4, media_sequence=0, discont_before=(2,),
+             durations=["2", "2", "2", "2"],
+             pdt_before={0: T0}, uris=[f"a{i}.ts" for i in range(4)])
+    a1 = m3u(4, media_sequence=4, discont_before=(2,),
+             durations=["2", "2", "2", "2"],
+             pdt_before={0: "2024-01-01T19:04:10Z"},
+             uris=[f"a{i}.ts" for i in range(4, 8)])
+    ub, sb = _plain_stream(URL_B, 20, ["6", "6"], anchor="2024-01-01T19:04:07Z",
+                           uris=["b20.ts", "b21.ts"])
+    result = _render(intersect_streams(URL_A, [a0, a1], ub, sb))
+    assert result == [
+        (4, 20, "2024-01-01T19:04:10Z", "2024-01-01T19:04:12Z", "0", "3"),
+        (5, 20, "2024-01-01T19:04:12Z", "2024-01-01T19:04:13Z", "0", "5"),
+        (5, 21, "2024-01-01T19:04:13Z", "2024-01-01T19:04:14Z", "1", "0"),
+    ]
+
+
+# --------------------------------------------------- API: /v1/intersect
+
+def intersect_post(a_url, a_snaps, b_url, b_snaps):
+    return client.post(
+        "/v1/intersect",
+        json={
+            "a": {"playlist_url": a_url, "snapshots": a_snaps},
+            "b": {"playlist_url": b_url, "snapshots": b_snaps},
+        },
+    )
+
+
+def test_api_intersect_happy_path_splits_pairs():
+    snap_a = m3u(3, media_sequence=0, durations=["2", "2", "2"],
+                 pdt_before={0: T0}, uris=[f"a{i}.ts" for i in range(3)])
+    snap_b = m3u(3, media_sequence=10, durations=["3", "3", "3"],
+                 pdt_before={0: T0}, uris=[f"b{i}.ts" for i in range(3)])
+    resp = intersect_post(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "intervals": [
+            {"sequence_a": 0, "sequence_b": 10,
+             "start_at": "2024-01-01T19:04:00Z", "end_at": "2024-01-01T19:04:02Z",
+             "offset_a": "0", "offset_b": "0"},
+            {"sequence_a": 1, "sequence_b": 10,
+             "start_at": "2024-01-01T19:04:02Z", "end_at": "2024-01-01T19:04:03Z",
+             "offset_a": "0", "offset_b": "2"},
+            {"sequence_a": 1, "sequence_b": 11,
+             "start_at": "2024-01-01T19:04:03Z", "end_at": "2024-01-01T19:04:04Z",
+             "offset_a": "1", "offset_b": "0"},
+            {"sequence_a": 2, "sequence_b": 11,
+             "start_at": "2024-01-01T19:04:04Z", "end_at": "2024-01-01T19:04:06Z",
+             "offset_a": "0", "offset_b": "1"},
+        ]
+    }
+
+
+def test_api_intersect_empty_coverage_returns_empty_list():
+    snap_a = m3u(2, media_sequence=0, durations=["2", "2"],
+                 pdt_before={0: T0}, uris=["a0.ts", "a1.ts"])
+    snap_b = m3u(2, media_sequence=0, durations=["2", "2"],
+                 pdt_before={0: "2024-01-01T20:00:00Z"}, uris=["b0.ts", "b1.ts"])
+    resp = intersect_post(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"intervals": []}
+
+
+def test_api_intersect_self_overlap_is_422():
+    snap_a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:05Z",
+        "#EXTINF:10,", "a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:06Z",
+        "#EXTINF:10,", "a1.ts",
+    ]) + "\n"
+    snap_b = m3u(1, media_sequence=0, durations=["10"],
+                 pdt_before={0: "2024-01-01T19:04:05Z"}, uris=["b0.ts"])
+    resp = intersect_post(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "ambiguous_program_time"
+    assert body["stream"] == "a"
+    assert body["sequences"] == [0, 1]
+
+
+def test_api_intersect_anchor_conflict_is_422():
+    good = m3u(1, media_sequence=0, pdt_before={0: "2024-01-01T19:04:05Z"},
+               uris=["x.ts"])
+    bad = m3u(1, media_sequence=0, pdt_before={0: "2024-01-01T19:04:09Z"},
+              uris=["x.ts"])
+    snap_b = m3u(1, media_sequence=0, pdt_before={0: "2024-01-01T19:04:05Z"},
+                 uris=["y.ts"])
+    resp = intersect_post(URL_A, [good, bad], URL_B, [snap_b, snap_b])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "program_time_conflict"
+    assert body["stream"] == "a"
+    assert body["snapshot_index"] == 1
+    assert body["sequence"] == 0
+
+
+def test_api_intersect_merge_error_is_422_tagged_with_stream():
+    s10 = m3u(1, media_sequence=10, uris=["a.ts"])
+    s9 = m3u(1, media_sequence=9, uris=["a.ts"])
+    snap_b = m3u(1, media_sequence=0, pdt_before={0: T0}, uris=["b.ts"])
+    resp = intersect_post(URL_A, [s10, s9], URL_B, [snap_b, snap_b])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "sequence_rollback"
+    assert body["stream"] == "a"
+    assert body["snapshot_index"] == 1
+
+
+def test_api_intersect_rejects_invalid_request_shapes():
+    snap = m3u(1, media_sequence=0, pdt_before={0: T0})
+    # Missing side b.
+    resp = client.post("/v1/intersect",
+                       json={"a": {"playlist_url": URL_A, "snapshots": [snap, snap]}})
+    assert resp.status_code == 422
+    # Only one snapshot per stream.
+    resp = intersect_post(URL_A, [snap], URL_B, [snap])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any("snapshots" in err["loc"] for err in detail)
