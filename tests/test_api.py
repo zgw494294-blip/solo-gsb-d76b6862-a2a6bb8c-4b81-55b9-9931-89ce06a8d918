@@ -1050,3 +1050,335 @@ def test_api_fetch_plan_merge_errors_still_return_422():
 def test_api_fetch_plan_rejects_wrong_snapshot_count():
     assert fetch_plan_post([m3u(1)]).status_code == 422
     assert fetch_plan_post([m3u(1)] * 31).status_code == 422
+
+
+# ------------------------------------------------------- API: /v1/overlap
+
+from app.overlap import overlap_tracks  # noqa: E402
+
+URL_A = "https://a.example.com/live/index.m3u8"
+URL_B = "https://b.example.com/live/index.m3u8"
+
+
+def tpl(*, media_sequence=0, durations, pdt_before=None, discont_before=(),
+        uri="seg.ts", discont_sequence=None):
+    """Build a playlist with per-segment decimal durations and PDT anchors."""
+
+    lines = ["#EXTM3U", f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}"]
+    if discont_sequence is not None:
+        lines.append(f"#EXT-X-DISCONTINUITY-SEQUENCE:{discont_sequence}")
+    pdt_before = pdt_before or {}
+    for i, duration in enumerate(durations):
+        if i in discont_before:
+            lines.append("#EXT-X-DISCONTINUITY")
+        if i in pdt_before:
+            lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{pdt_before[i]}")
+        lines.append(f"#EXTINF:{duration},")
+        lines.append(uri)
+    return "\n".join(lines) + "\n"
+
+
+def overlap_post(a_snaps, b_snaps, url_a=URL_A, url_b=URL_B):
+    return client.post(
+        "/v1/overlap",
+        json={
+            "a": {"playlist_url": url_a, "snapshots": a_snaps},
+            "b": {"playlist_url": url_b, "snapshots": b_snaps},
+        },
+    )
+
+
+def test_overlap_splits_at_both_tracks_boundaries():
+    # Track a: 4 x 10s anchored at 19:04:00Z -> [00,10)[10,20)[20,30)[30,40).
+    a = tpl(media_sequence=0, durations=["10", "10", "10", "10"],
+            pdt_before={0: "2024-01-01T19:04:00Z"})
+    # Track b: 4 x 10s anchored at 19:04:05Z -> [05,15)[15,25)[25,35)[35,45).
+    b = tpl(media_sequence=10, durations=["10", "10", "10", "10"],
+            pdt_before={0: "2024-01-01T19:04:05Z"})
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["playlist_url_a"] == URL_A
+    assert body["playlist_url_b"] == URL_B
+    assert body["overlaps"] == [
+        {"sequence_a": 0, "sequence_b": 10,
+         "start_at": "2024-01-01T19:04:05Z", "end_at": "2024-01-01T19:04:10Z",
+         "offset_a": "5", "offset_b": "0"},
+        {"sequence_a": 1, "sequence_b": 10,
+         "start_at": "2024-01-01T19:04:10Z", "end_at": "2024-01-01T19:04:15Z",
+         "offset_a": "0", "offset_b": "5"},
+        {"sequence_a": 1, "sequence_b": 11,
+         "start_at": "2024-01-01T19:04:15Z", "end_at": "2024-01-01T19:04:20Z",
+         "offset_a": "5", "offset_b": "0"},
+        {"sequence_a": 2, "sequence_b": 11,
+         "start_at": "2024-01-01T19:04:20Z", "end_at": "2024-01-01T19:04:25Z",
+         "offset_a": "0", "offset_b": "5"},
+        {"sequence_a": 2, "sequence_b": 12,
+         "start_at": "2024-01-01T19:04:25Z", "end_at": "2024-01-01T19:04:30Z",
+         "offset_a": "5", "offset_b": "0"},
+        {"sequence_a": 3, "sequence_b": 12,
+         "start_at": "2024-01-01T19:04:30Z", "end_at": "2024-01-01T19:04:35Z",
+         "offset_a": "0", "offset_b": "5"},
+        {"sequence_a": 3, "sequence_b": 13,
+         "start_at": "2024-01-01T19:04:35Z", "end_at": "2024-01-01T19:04:40Z",
+         "offset_a": "5", "offset_b": "0"},
+    ]
+
+
+def test_overlap_keeps_exact_decimal_offsets():
+    # a: [05.0,06.1)[06.1,07.2)[07.2,08.3); b starts 0.5s later.
+    a = tpl(media_sequence=0, durations=["1.10", "1.10", "1.10"],
+            pdt_before={0: "2024-01-01T19:04:05Z"})
+    b = tpl(media_sequence=10, durations=["1.10", "1.10", "1.10"],
+            pdt_before={0: "2024-01-01T19:04:05.5Z"})
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlaps"] == [
+        {"sequence_a": 0, "sequence_b": 10,
+         "start_at": "2024-01-01T19:04:05.5Z", "end_at": "2024-01-01T19:04:06.1Z",
+         "offset_a": "0.5", "offset_b": "0.0"},
+        {"sequence_a": 1, "sequence_b": 10,
+         "start_at": "2024-01-01T19:04:06.1Z", "end_at": "2024-01-01T19:04:06.6Z",
+         "offset_a": "0.00", "offset_b": "0.60"},
+        {"sequence_a": 1, "sequence_b": 11,
+         "start_at": "2024-01-01T19:04:06.6Z", "end_at": "2024-01-01T19:04:07.2Z",
+         "offset_a": "0.50", "offset_b": "0.00"},
+        {"sequence_a": 2, "sequence_b": 11,
+         "start_at": "2024-01-01T19:04:07.2Z", "end_at": "2024-01-01T19:04:07.7Z",
+         "offset_a": "0.00", "offset_b": "0.60"},
+        {"sequence_a": 2, "sequence_b": 12,
+         "start_at": "2024-01-01T19:04:07.7Z", "end_at": "2024-01-01T19:04:08.3Z",
+         "offset_a": "0.50", "offset_b": "0.00"},
+    ]
+
+
+def test_overlap_normalizes_timezone_offsets():
+    a = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-02T03:04:05+08:00"})  # == 19:04:05Z
+    b = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:05Z"})
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlaps"] == [
+        {"sequence_a": 0, "sequence_b": 0,
+         "start_at": "2024-01-01T19:04:05Z", "end_at": "2024-01-01T19:04:15Z",
+         "offset_a": "0", "offset_b": "0"},
+    ]
+
+
+def test_overlap_without_common_coverage_returns_empty_list():
+    a = tpl(media_sequence=0, durations=["10", "10"],
+            pdt_before={0: "2024-01-01T19:04:00Z"})  # [00,20)
+    b = tpl(media_sequence=0, durations=["10", "10"],
+            pdt_before={0: "2024-01-01T19:05:00Z"})  # [60,80)
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlaps"] == []
+
+
+def test_overlap_half_open_touching_ranges_produce_nothing():
+    a = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:00Z"})  # [00,10)
+    b = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:10Z"})  # [10,20)
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlaps"] == []
+
+
+def test_overlap_without_any_anchor_returns_empty_list():
+    a = [m3u(3, media_sequence=0), m3u(3, media_sequence=2)]
+    b_uris = ["b.ts", "b.ts", "b.ts"]
+    b = [m3u(3, media_sequence=0, uris=b_uris),
+         m3u(3, media_sequence=2, uris=b_uris)]
+    resp = overlap_post(a, b)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlaps"] == []
+
+
+def test_overlap_never_fills_unanchored_region_from_other_track():
+    # Track a: anchored run seq0,1 [00,20); then a break; seq2,3 unanchored.
+    a = tpl(media_sequence=0,
+            durations=["10", "10", "10", "10"],
+            discont_before=(2,),
+            pdt_before={0: "2024-01-01T19:04:00Z"})
+    # Track b is anchored [15,45). Only a's known [00,20) may pair; the
+    # unanchored seq2,3 (timeline seconds 20..40) must stay uncovered.
+    b = tpl(media_sequence=10, durations=["10", "10", "10"],
+            pdt_before={0: "2024-01-01T19:04:15Z"})
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlaps"] == [
+        {"sequence_a": 1, "sequence_b": 10,
+         "start_at": "2024-01-01T19:04:15Z", "end_at": "2024-01-01T19:04:20Z",
+         "offset_a": "5", "offset_b": "0"},
+    ]
+
+
+def test_overlap_counter_reuse_runs_stay_independent():
+    # Two adjacent, non-overlapping snapshots reuse discontinuity counters;
+    # each run carries its own anchor and must be resolved independently.
+    s0 = tpl(media_sequence=0,
+             durations=["1.10", "1.10", "1.10", "1.10"],
+             discont_before=(2,),
+             pdt_before={0: "2024-01-01T19:04:00Z"},
+             uri="seg.ts")
+    s1 = tpl(media_sequence=4,
+             durations=["1.10", "1.10", "1.10", "1.10"],
+             discont_before=(2,),
+             pdt_before={0: "2024-01-01T20:00:00Z"},
+             uri="seg.ts")
+    b = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:01Z"})  # [01,11)
+    resp = overlap_post([s0, s1], [b, b])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["overlaps"] == [
+        {"sequence_a": 0, "sequence_b": 0,
+         "start_at": "2024-01-01T19:04:01Z", "end_at": "2024-01-01T19:04:01.1Z",
+         "offset_a": "1", "offset_b": "0"},
+        {"sequence_a": 1, "sequence_b": 0,
+         "start_at": "2024-01-01T19:04:01.1Z", "end_at": "2024-01-01T19:04:02.2Z",
+         "offset_a": "0.00", "offset_b": "0.10"},
+    ]
+
+
+def test_overlap_self_overlapping_track_is_422():
+    # Track a has two anchored runs whose UTC ranges overlap [10,20).
+    a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:00Z",
+        "#EXTINF:20,", "a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:10Z",
+        "#EXTINF:20,", "a1.ts",
+    ]) + "\n"
+    b = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:12Z"})
+
+    with pytest.raises(LocateError) as exc:
+        overlap_tracks(URL_A, [a, a], URL_B, [b, b])
+    assert exc.value.code == "ambiguous_program_time"
+    assert exc.value.status == 422
+    assert exc.value.track == "a"
+    assert exc.value.sequences == [0, 1]
+
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "ambiguous_program_time"
+    assert body["track"] == "a"
+    assert body["sequences"] == [0, 1]
+
+
+def test_overlap_touching_runs_are_not_self_overlap():
+    # Two anchored runs meeting exactly at an instant (half-open) are fine.
+    a = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:00Z",
+        "#EXTINF:10,", "a0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:10Z",
+        "#EXTINF:10,", "a1.ts",
+    ]) + "\n"
+    b = tpl(media_sequence=0, durations=["20"],
+            pdt_before={0: "2024-01-01T19:04:05Z"})
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 200, resp.text
+    assert [pair["sequence_a"] for pair in resp.json()["overlaps"]] == [0, 1]
+
+
+def test_overlap_self_overlap_in_track_b_is_tagged_b():
+    a = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:12Z"})
+    b = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:00Z",
+        "#EXTINF:20,", "b0.ts",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:10Z",
+        "#EXTINF:20,", "b1.ts",
+    ]) + "\n"
+    resp = overlap_post([a, a], [b, b])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "ambiguous_program_time"
+    assert body["track"] == "b"
+    assert body["sequences"] == [0, 1]
+
+
+def test_overlap_anchor_conflict_is_tagged_with_track():
+    s0 = tpl(media_sequence=0, durations=["10"],
+             pdt_before={0: "2024-01-01T19:04:00Z"})
+    s1 = tpl(media_sequence=0, durations=["10"],
+             pdt_before={0: "2024-01-01T19:04:09Z"})
+    b = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:00Z"})
+    resp = overlap_post([s0, s1], [b, b])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "program_time_conflict"
+    assert body["track"] == "a"
+    assert body["snapshot_index"] == 1
+    assert body["sequence"] == 0
+
+
+def test_overlap_merge_error_is_tagged_with_track():
+    a = [m3u(2, media_sequence=10), m3u(2, media_sequence=9)]
+    b = [m3u(1), m3u(1)]
+    resp = overlap_post(a, b)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "sequence_rollback"
+    assert body["track"] == "a"
+    assert body["snapshot_index"] == 1
+    assert body["sequence"] == 9
+
+
+def test_overlap_invalid_playlist_is_tagged_with_track():
+    a = [m3u(1), m3u(1)]
+    bad = "#EXT-X-PROGRAM-DATE-TIME:not-a-date\n#EXTINF:1,\nx.ts\n"
+    resp = overlap_post(a, ["#EXTM3U\n" + bad, "#EXTM3U\n" + bad])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "invalid_playlist"
+    assert body["track"] == "b"
+
+
+def test_overlap_rejects_missing_track():
+    resp = client.post(
+        "/v1/overlap",
+        json={"a": {"playlist_url": URL_A, "snapshots": [m3u(1), m3u(1)]}},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"] == "invalid_request"
+
+
+def test_overlap_rejects_bad_snapshot_count_nested():
+    good = {"playlist_url": URL_A, "snapshots": [m3u(1), m3u(1)]}
+    too_few = {"playlist_url": URL_B, "snapshots": [m3u(1)]}
+    resp = client.post("/v1/overlap", json={"a": good, "b": too_few})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "invalid_request"
+    locs = [tuple(err["loc"]) for err in body["detail"]]
+    assert ("body", "b", "snapshots") in locs
+
+
+def test_overlap_tracks_use_independent_playlist_url_bases():
+    a = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:00Z"}, uri="clip.ts")
+    b = tpl(media_sequence=0, durations=["10"],
+            pdt_before={0: "2024-01-01T19:04:00Z"}, uri="clip.ts")
+    # URI lines stay relative; only per-track resolution differs, and the
+    # response never needs URIs — pairing is purely by program time.
+    resp = overlap_post(
+        [a, a], [b, b],
+        url_a="https://a.example.com/live/index.m3u8",
+        url_b="https://b.example.com/other/idx.m3u8",
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["overlaps"]) == 1
+

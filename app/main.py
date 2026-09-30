@@ -20,6 +20,7 @@ from .locate import (
     locate,
     parse_program_time,
 )
+from .overlap import overlap_tracks
 from .reconcile import ReconcileError, reconcile
 from .vod import export_vod
 
@@ -104,6 +105,17 @@ class FetchPlanRequest(ReconcileRequest):
         return value
 
 
+class TrackRequest(ReconcileRequest):
+    """One independent live track: its playlist URL and ordered snapshots."""
+
+
+class OverlapRequest(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    a: TrackRequest
+    b: TrackRequest
+
+
 class SegmentOut(BaseModel):
     sequence: int
     uri: str
@@ -160,6 +172,21 @@ class FetchPlanResponse(BaseModel):
     segments: list[SegmentFetchOut]
 
 
+class OverlapPairOut(BaseModel):
+    sequence_a: int
+    sequence_b: int
+    start_at: str
+    end_at: str
+    offset_a: str
+    offset_b: str
+
+
+class OverlapResponse(BaseModel):
+    playlist_url_a: str
+    playlist_url_b: str
+    overlaps: list[OverlapPairOut]
+
+
 class ErrorDetail(BaseModel):
     snapshot_index: Optional[int] = None
     sequence: Optional[int] = None
@@ -199,6 +226,7 @@ async def locate_error_handler(_request: Request, exc: LocateError) -> JSONRespo
         snapshot_index=exc.snapshot_index,
         sequence=exc.sequence,
         sequences=exc.sequences,
+        track=exc.track,
     )
 
 
@@ -209,6 +237,7 @@ async def reconcile_error_handler(_request: Request, exc: ReconcileError) -> JSO
         exc.message,
         snapshot_index=exc.snapshot_index,
         sequence=exc.sequence,
+        track=exc.track,
     )
 
 
@@ -309,5 +338,30 @@ async def fetch_plan_endpoint(payload: FetchPlanRequest) -> FetchPlanResponse:
                 length=item.length,
             )
             for item in plan.segments
+        ],
+    )
+
+
+@app.post("/v1/overlap", response_model=OverlapResponse)
+async def overlap_endpoint(payload: OverlapRequest) -> OverlapResponse:
+    result = overlap_tracks(
+        payload.a.playlist_url,
+        payload.a.snapshots,
+        payload.b.playlist_url,
+        payload.b.snapshots,
+    )
+    return OverlapResponse(
+        playlist_url_a=payload.a.playlist_url,
+        playlist_url_b=payload.b.playlist_url,
+        overlaps=[
+            OverlapPairOut(
+                sequence_a=pair.sequence_a,
+                sequence_b=pair.sequence_b,
+                start_at=format_program_time(pair.start_at),
+                end_at=format_program_time(pair.end_at),
+                offset_a=format(pair.offset_a, "f"),
+                offset_b=format(pair.offset_b, "f"),
+            )
+            for pair in result.pairs
         ],
     )

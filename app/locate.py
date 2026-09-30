@@ -55,12 +55,14 @@ class LocateError(ReconcileError):
         snapshot_index: Optional[int] = None,
         sequence: Optional[int] = None,
         sequences: Optional[list[int]] = None,
+        track: Optional[str] = None,
     ) -> None:
         super().__init__(
             code,
             message,
             snapshot_index=snapshot_index,
             sequence=sequence,
+            track=track,
         )
         self.status = status
         self.sequences = sequences
@@ -135,6 +137,23 @@ class LocatedSegment:
     offset: Decimal
 
 
+@dataclass(frozen=True)
+class KnownProgramSegment:
+    """A segment whose half-open UTC program-time range is known.
+
+    ``run_index`` identifies the contiguous discontinuity run the segment
+    belongs to (its position among the runs of *this* timeline); a later,
+    separate run may reuse the same discontinuity counter and still gets a
+    different index.
+    """
+
+    sequence: int
+    uri: str
+    start_at: Decimal
+    end_at: Decimal
+    run_index: int
+
+
 @dataclass
 class _Interval:
     """One contiguous run of segments sharing a discontinuity counter.
@@ -147,8 +166,6 @@ class _Interval:
     segments: list[Segment]
     # Exact duration of [first segment start, segment start), by sequence.
     prefix: dict[int, Decimal]
-    # Exact UTC start of every segment, filled once anchors are validated.
-    utc_starts: dict[int, Decimal]
     # PDT anchors whose sequence belongs to this run.
     anchors: list[Anchor]
 
@@ -207,7 +224,6 @@ def _build_intervals(timeline) -> list[_Interval]:
                 discontinuity=seg.discontinuity,
                 segments=[],
                 prefix={},
-                utc_starts={},
                 anchors=[],
             )
             intervals.append(current)
@@ -222,26 +238,30 @@ def _build_intervals(timeline) -> list[_Interval]:
     return intervals
 
 
-def locate(
+def resolve_program_segments(
     playlist_url: str,
     snapshots: Iterable[str],
-    target_raw: str,
-) -> LocatedSegment:
-    """Locate the segment whose half-open UTC range contains ``target_raw``.
+    timeline,
+) -> list[KnownProgramSegment]:
+    """Resolve the known UTC half-open range of every anchored segment.
 
-    ``target_raw`` must be a timezone-aware RFC 3339 date-time.
+    The timeline must already be reconciled from ``playlist_url`` /
+    ``snapshots`` with :func:`reconcile` (the caller does so that the usual
+    merge errors surface in their original form). Anchors are collected,
+    attributed to the contiguous sequence runs that actually contain their
+    sequence numbers (never keyed by discontinuity counter alone) and
+    validated exactly as for ``/v1/locate``:
 
-    Raises :class:`LocateError` (mapped to 404/422) on every failure.
+    * cross-snapshot anchors on the same sequence must denote the same UTC
+      instant after normalization;
+    * multiple anchors inside one run must agree with decimal-duration
+      extrapolation from the first anchor.
+
+    Only segments of runs carrying at least one anchor are returned; an
+    unanchored run has no known time and is never filled in from another run
+    or another track. The result is ordered by UTC start (and, on ties, by
+    sequence number).
     """
-
-    # The same merge rules as /v1/reconcile apply (rollback, gap, overlap
-    # conflicts on URI/duration/byte range/discontinuity).
-    timeline = reconcile(playlist_url, snapshots)
-
-    try:
-        target = parse_program_time(target_raw)
-    except PlaylistParseError as exc:
-        raise LocateError("invalid_request", str(exc), status=422) from exc
 
     anchors = _parse_anchors(playlist_url, snapshots)
     intervals = _build_intervals(timeline)
@@ -266,11 +286,12 @@ def locate(
             )
         interval.anchors.append(anchor)
 
+    known: list[KnownProgramSegment] = []
     # Anchors are validated independently within every contiguous run:
     # cross-snapshot anchors on the same sequence must denote the same UTC
     # instant, and multiple anchors inside one run must agree with
     # extrapolation from the first. A run with no anchor has no known time.
-    for interval in intervals:
+    for run_index, interval in enumerate(intervals):
         if not interval.anchors:
             continue
         interval.anchors.sort(key=lambda item: item.sequence)
@@ -324,20 +345,50 @@ def locate(
         anchor = min(interval.anchors, key=lambda item: item.sequence)
         anchor_offset = interval.prefix[anchor.sequence]
         for seg in interval.segments:
-            interval.utc_starts[seg.sequence] = (
+            utc_start = (
                 anchor.utc_start + interval.prefix[seg.sequence] - anchor_offset
             )
+            known.append(
+                KnownProgramSegment(
+                    sequence=seg.sequence,
+                    uri=seg.uri,
+                    start_at=utc_start,
+                    end_at=utc_start + seg.duration,
+                    run_index=run_index,
+                )
+            )
+
+    known.sort(key=lambda item: (item.start_at, item.sequence))
+    return known
+
+
+def locate(
+    playlist_url: str,
+    snapshots: Iterable[str],
+    target_raw: str,
+) -> LocatedSegment:
+    """Locate the segment whose half-open UTC range contains ``target_raw``.
+
+    ``target_raw`` must be a timezone-aware RFC 3339 date-time.
+
+    Raises :class:`LocateError` (mapped to 404/422) on every failure.
+    """
+
+    # The same merge rules as /v1/reconcile apply (rollback, gap, overlap
+    # conflicts on URI/duration/byte range/discontinuity).
+    timeline = reconcile(playlist_url, snapshots)
+
+    try:
+        target = parse_program_time(target_raw)
+    except PlaylistParseError as exc:
+        raise LocateError("invalid_request", str(exc), status=422) from exc
+
+    known = resolve_program_segments(playlist_url, snapshots, timeline)
 
     # Half-open [start, end) lookup over every anchored region.
-    hits: list[tuple[Segment, Decimal, Decimal]] = []
-    for interval in intervals:
-        for seg in interval.segments:
-            utc_start = interval.utc_starts.get(seg.sequence)
-            if utc_start is None:
-                continue
-            utc_end = utc_start + seg.duration
-            if utc_start <= target < utc_end:
-                hits.append((seg, utc_start, utc_end))
+    hits = [
+        item for item in known if item.start_at <= target < item.end_at
+    ]
 
     if not hits:
         raise LocateError(
@@ -350,7 +401,7 @@ def locate(
         # Ranges inside one contiguous run are disjoint, so multiple hits can
         # only come from distinct anchored runs (they may even reuse the same
         # discontinuity counter on a later, separate sequence run).
-        sequences = sorted(seg.sequence for seg, _, _ in hits)
+        sequences = sorted(item.sequence for item in hits)
         raise LocateError(
             "ambiguous_program_time",
             (
@@ -361,11 +412,11 @@ def locate(
             sequences=sequences,
         )
 
-    seg, utc_start, utc_end = hits[0]
+    item = hits[0]
     return LocatedSegment(
-        sequence=seg.sequence,
-        uri=seg.uri,
-        start_at=utc_start,
-        end_at=utc_end,
-        offset=target - utc_start,
+        sequence=item.sequence,
+        uri=item.uri,
+        start_at=item.start_at,
+        end_at=item.end_at,
+        offset=target - item.start_at,
     )

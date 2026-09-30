@@ -19,12 +19,16 @@ class ReconcileError(Exception):
         *,
         snapshot_index: Optional[int] = None,
         sequence: Optional[int] = None,
+        track: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.snapshot_index = snapshot_index
         self.sequence = sequence
+        # Set when the failure occurred while processing one named track of a
+        # multi-track request (e.g. "a" / "b" on /v1/overlap).
+        self.track = track
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@
 连续、带精确小数起止秒数的切片时间线。**完全离线**：服务不发起任何网络请求，
 `playlist_url` 仅用于解析相对 URI。
 
-提供四个接口：
+提供五个接口：
 
 - `POST /v1/reconcile`：复原整条切片时间线（序号、URI、精确十进制相对起止秒数、
   字节范围、不连续计数）。
@@ -17,6 +17,10 @@
 - `POST /v1/fetch-plan`：为复原后的窗口生成**媒体片段获取计划**——去重合并后的
   资源请求列表（完整资源 / `Range: bytes=起点-终点`）及每个片段到请求响应体的
   逐段映射。
+- `POST /v1/overlap`：接收**两路各自独立**的直播（`a`、`b`，各带 `playlist_url`
+  与按时间排序的 snapshots），沿用同一套合并、PDT 锚点校验与 UTC 十进制推时规则，
+  输出两路**共同节目时间区间**：只在两路都有已知节目时间的片段上取半开区间交集，
+  按 UTC 起点给出每段配对序号、共同起止与共同起点在各自片段内的精确秒偏移。
 
 ## 单条命令启动
 
@@ -26,7 +30,7 @@ docker compose up --build
 
 服务监听 **8000** 端口（容器内 `8000`，映射到宿主机 `8000`）：
 
-- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/vod`、`POST http://localhost:8000/v1/fetch-plan`
+- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/vod`、`POST http://localhost:8000/v1/fetch-plan`、`POST http://localhost:8000/v1/overlap`
 - 健康检查：`GET http://localhost:8000/healthz`
 - 交互式文档：`http://localhost:8000/docs`
 
@@ -388,6 +392,112 @@ curl -s http://localhost:8000/v1/fetch-plan \
 `bytes=0-149` 请求；`[200,240)` 不相邻，单独生成 `bytes=200-239`；
 `clip.ts` 是完整资源，只请求一次。
 
+## `POST /v1/overlap`：两路直播的共同节目时间区间
+
+请求体包含**两路各自独立**的直播 `a` 与 `b`；每一路都是与 `/v1/locate`
+完全相同的 `playlist_url` + 按抓取时间排序的 `snapshots`（长度 2～30，
+每份 1～100 段），两路互不共享序号、URI 或时间线：
+
+```json
+{
+  "a": {
+    "playlist_url": "https://a.example.com/live/index.m3u8",
+    "snapshots": ["#EXTM3U\n...", "#EXTM3U\n..."]
+  },
+  "b": {
+    "playlist_url": "https://b.example.com/live/index.m3u8",
+    "snapshots": ["#EXTM3U\n...", "#EXTM3U\n..."]
+  }
+}
+```
+
+### 推算与交集规则
+
+1. **各自沿用旧规则**：每一路独立执行与 `/v1/reconcile` 相同的合并
+   （回退、空洞、重叠冲突等），以及与 `/v1/locate` 相同的
+   `#EXT-X-PROGRAM-DATE-TIME` 锚点归属、跨快照/同区间锚点一致性校验、
+   UTC 归一与 `Decimal` 十进制推时；时间**绝不跨越
+   `#EXT-X-DISCONTINUITY`**，复用同一断点计数的两个连续序号区间也各自独立。
+   锚点冲突与合并错误仍返回原来的错误码，并额外带 `track`（`"a"` / `"b"`）
+   与该路内的 `snapshot_index`、`sequence`。
+2. **只取双方都有已知时间的片段**：无锚点的断点区间没有任何已知 UTC 覆盖，
+   **既不能借同一路另一段时间补齐，也不能借另一路的时间补齐**——这些片段
+   不参与交集。
+3. **半开区间交集**：对两路各自的已知片段 `[start_at, end_at)` 取交集。
+   两路切片边界不必对齐；交集按两路边界全部切开，得到的每一个实际交叠都
+   输出为一条配对。区间仅在端点相触（一段终点等于另一段起点）时交集为零，
+   不输出。一路内部同一段连续区间内的片段天然互不交叠。
+4. **同一路节目时间自重叠 → 422**：若同一路的**不同断点区间**已知 UTC 时间
+   自身发生正长度重叠（断点两侧节目时钟重叠，或计数复用的独立区间落在同一
+   时刻），该时刻在这一路无法确定唯一对应片段，也就无法确定唯一配对，
+   返回 422 `ambiguous_program_time`（带 `track` 与候选 `sequences`），
+   无论另一路是否覆盖该时刻。仅端点相触不算重叠。
+5. 两路都没有共同覆盖（含两路全无锚点、覆盖完全错过、只在端点相触）时
+   返回 `200`，`overlaps` 为空列表。
+
+### 响应（200）
+
+结果按共同区间 **UTC 起点**排序（起点相同时按两路序号排序）：
+
+```json
+{
+  "playlist_url_a": "https://a.example.com/live/index.m3u8",
+  "playlist_url_b": "https://b.example.com/live/index.m3u8",
+  "overlaps": [
+    {
+      "sequence_a": 0,
+      "sequence_b": 10,
+      "start_at": "2024-01-01T19:04:05Z",
+      "end_at": "2024-01-01T19:04:10Z",
+      "offset_a": "5",
+      "offset_b": "0"
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `sequence_a` / `sequence_b` | 该共同区间在 a、b 两路合并时间线上的片段序号 |
+| `start_at` / `end_at` | 共同半开区间 `[start_at, end_at)` 的 **UTC** 起止（RFC 3339，`Z` 结尾，含必要的精确小数秒） |
+| `offset_a` / `offset_b` | 共同起点相对**各自片段**起点的精确十进制片内秒偏移（≥0，小于该片段时长） |
+
+错误：
+
+| 状态码 | `error` | 触发条件 |
+| --- | --- | --- |
+| 422 | `ambiguous_program_time` | 同一路不同断点区间的已知节目时间自身正长度重叠，无法唯一配对；带 `track` 与 `sequences` |
+| 422 | `program_time_conflict` | 某一路跨快照同序号锚点 UTC 不一致，或同区间多锚点与十进制推算不一致；带 `track`、`snapshot_index`、`sequence` |
+| 422 | `invalid_playlist` | 某一路快照无法解析（含非法/悬空 PDT），带 `track` 与 `snapshot_index`（可知时带 `sequence`） |
+| 422 | 其余合并类错误 | `sequence_rollback`、`sequence_gap`、`overlap_conflict`、`empty_playlist`、`too_many_segments` 等，同 `/v1/reconcile`，均带 `track` |
+| 422 | `invalid_request` | 缺少 `a`/`b`、任一路快照数量不在 2～30、字段缺失/类型错误等（错误定位含 `a`/`b` 路径） |
+
+```bash
+curl -s http://localhost:8000/v1/overlap \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:00Z\n#EXTINF:10,\na0.ts\n#EXTINF:10,\na1.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:10,\na1.ts\n#EXTINF:10,\na2.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T19:04:05Z\n#EXTINF:10,\nb10.ts\n#EXTINF:10,\nb11.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:11\n#EXTINF:10,\nb11.ts\n#EXTINF:10,\nb12.ts\n"
+      ]
+    }
+  }'
+```
+
+上例中 a 路已知覆盖 `[19:04:00, 19:04:30)`（序号 0、1、2），b 路已知覆盖
+`[19:04:05, 19:04:35)`（序号 10、11、12），共同覆盖
+`[19:04:05, 19:04:30)` 按两路 10 秒边界切成 5 条配对，例如
+`(a=1, b=10)` 对应 `[19:04:10, 19:04:15)`、`offset_a=0`、`offset_b=5`。
+
 ## 快速验证
 
 ```bash
@@ -411,6 +521,7 @@ app/
   locate.py      # PDT 精确 UTC 解析/推算、锚点一致性校验、半开区间定位
   vod.py         # 按秒区间选段、VOD 清单渲染（VERSION:4 / ENDLIST / 多带秒数）
   fetchplan.py   # 资源请求去重与字节区间合并、逐段响应体映射
+  overlap.py     # 两路各自锚定区间推算、同路自重叠检测、半开交集配对
   main.py        # FastAPI 路由、请求/响应模型、422/404 错误处理
 tests/test_api.py
 Dockerfile
